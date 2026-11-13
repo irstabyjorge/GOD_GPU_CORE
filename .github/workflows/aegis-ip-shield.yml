@@ -1,0 +1,148 @@
+name: AEGIS GitHub IP SHIELD
+
+on:
+  push:
+    branches-ignore:
+      - ip-shield-ledger
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aegis-ip-shield-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout full Git history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Generate SHA-256 provenance inventory
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, subprocess
+          from pathlib import Path
+
+          def git(*args):
+              return subprocess.check_output(["git", *args])
+
+          head = git("rev-parse", "HEAD").decode().strip()
+          tree = git("rev-parse", f"{head}^{{tree}}").decode().strip()
+          raw = git("ls-tree", "-r", "-z", head)
+          entries = []
+          for item in raw.split(b"\0"):
+              if not item:
+                  continue
+              meta, raw_path = item.split(b"\t", 1)
+              mode, kind, oid = meta.decode().split(" ", 2)
+              if kind == "blob":
+                  entries.append((raw_path.decode("utf-8", "surrogateescape"), mode, oid))
+          entries = entries[:25000]
+
+          p = subprocess.Popen(["git", "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+          p.stdin.write(b"".join(oid.encode() + b"\n" for _, _, oid in entries))
+          p.stdin.close()
+          files = []
+          for path, mode, oid in entries:
+              header = p.stdout.readline().split()
+              if len(header) != 3 or header[1] != b"blob" or header[0].decode() != oid:
+                  raise RuntimeError("Git object metadata mismatch")
+              remaining = int(header[2])
+              digest = hashlib.sha256()
+              while remaining:
+                  chunk = p.stdout.read(min(65536, remaining))
+                  if not chunk:
+                      raise RuntimeError("Truncated Git object")
+                  digest.update(chunk)
+                  remaining -= len(chunk)
+              if p.stdout.read(1) != b"\n":
+                  raise RuntimeError("Malformed Git object boundary")
+              files.append({"path": path, "mode": mode, "git_blob_oid": oid, "sha256": digest.hexdigest()})
+          if p.wait() != 0:
+              raise RuntimeError("git cat-file failed")
+
+          log = git("log", "-n500", "--format=%H%x09%an%x09%ae%x09%aI%x09%s", head).decode("utf-8", "replace")
+          commits = []
+          for line in log.splitlines():
+              parts = line.split("\t", 4)
+              if len(parts) == 5:
+                  sha, name, email, authored, subject = parts
+                  commits.append({"sha": sha, "author_name_declared": name,
+                    "author_email_sha256": hashlib.sha256(email.lower().encode()).hexdigest(),
+                    "authored_at_declared": authored, "subject": subject})
+
+          report = {
+            "manifest_type": "AEGIS_GITHUB_IP_SHIELD_PROVENANCE",
+            "manifest_version": "1.0",
+            "generated_at_utc_runner_clock": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "repository": os.environ["GITHUB_REPOSITORY"],
+            "ref": os.environ["GITHUB_REF"],
+            "ref_name": os.environ["GITHUB_REF_NAME"],
+            "commit": head, "tree": tree,
+            "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+            "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+            "file_count_recorded": len(files), "file_inventory_truncated_at_25000": len(raw.split(b"\0")) - 1 > len(files),
+            "files": files, "commits": commits,
+            "limits": [
+              "Git author and timestamp fields are declared metadata, not verified identity or trusted time.",
+              "Hashes identify recorded bytes; they do not prove authorship, originality, ownership or infringement.",
+              "The report contains paths and hashes, not source-file contents.",
+              "The runner clock is not a trusted timestamp authority.",
+              "Third-party and joint contributions retain applicable rights and licenses.",
+              "The ledger branch is versioned evidence, not immutable storage.",
+              "Only this repository and triggered refs are covered."
+            ]
+          }
+          out = Path(os.environ["RUNNER_TEMP"]) / "ip-shield-report.json"
+          encoded = (json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode()
+          out.write_bytes(encoded)
+          checksum = hashlib.sha256(encoded).hexdigest()
+          out.with_suffix(".json.sha256").write_text(f"{checksum}  {out.name}\n")
+          print(f"IP SHIELD recorded {len(files)} tracked-file fingerprints at {head}")
+
+      - name: Upload provenance artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aegis-ip-shield-${{ github.run_id }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/ip-shield-report.json
+            ${{ runner.temp }}/ip-shield-report.json.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Preserve report in versioned ledger branch
+        if: github.event_name != 'pull_request' && github.ref != 'refs/heads/ip-shield-ledger'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin ip-shield-ledger || true
+          if git show-ref --verify --quiet refs/remotes/origin/ip-shield-ledger; then
+            git switch --force-create ip-shield-ledger origin/ip-shield-ledger
+          else
+            git switch --orphan ip-shield-ledger
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+          mkdir -p ledger
+          report_name="${GITHUB_RUN_ID}-${GITHUB_SHA}.json"
+          cp "${RUNNER_TEMP}/ip-shield-report.json" "ledger/${report_name}"
+          cp "${RUNNER_TEMP}/ip-shield-report.json.sha256" "ledger/${report_name}.sha256"
+          git add "ledger/${report_name}" "ledger/${report_name}.sha256"
+          git commit -m "Record IP provenance snapshot ${GITHUB_SHA}"
+          git push origin HEAD:refs/heads/ip-shield-ledger
